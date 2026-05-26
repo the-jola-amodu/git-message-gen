@@ -3,6 +3,7 @@
   "displayName": "git-message-gen",
   "description": "",
   "version": "0.0.1",
+  "type": "module",
   "engines": {
     "vscode": "^1.108.1"
   },
@@ -12,10 +13,12 @@
   "activationEvents": [],
   "main": "./extension.js",
   "contributes": {
-    "commands": [{
-      "command": "git-message-gen.helloWorld",
-      "title": "Hello World"
-    }]
+    "commands": [
+      {
+        "command": "git-message-gen.generateCommit",
+        "title": "Git Gen: Generate Commit Message"
+      }
+    ]
   },
   "scripts": {
     "lint": "eslint .",
@@ -23,11 +26,14 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.108.1",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
-    "eslint": "^9.39.2",
-    "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.5.2"
+    "@types/vscode": "^1.108.1",
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.39.2"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
   }
 }
