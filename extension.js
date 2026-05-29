@@ -1,84 +1,113 @@
-import { COMMIT_SYSTEM_PROMPT } from './prompts.js';
 import * as vscode from 'vscode';
+import { COMMIT_SYSTEM_PROMPT } from './prompts.js';
+import { getStagedDiffs, getProjectContext, getBranchName, getActiveRepo } from './utils/git-bridge.js';
+import { addToJournal, getRecentJournalEntries } from './utils/historian.js';
+import { scrubSensitiveData, summarizeLargeDiff } from './utils/ai-helpers.js';
 
-const systemPrompt = process.env.COMMIT_SYSTEM_PROMPT;
-
-// --- HELPER: Extracts the actual code changes ---
-async function getStagedDiff(repo) {
-    const changes = await repo.diffIndexWith('HEAD');
-    let fullDiff = "";
-
-    for (const change of changes) {
-        // repo.diff gives us the actual text content of the git diff
-        const diff = await repo.diff(change.uri.fsPath);
-        fullDiff += `--- File: ${change.uri.fsPath} ---\n${diff}\n\n`;
-    }
-    return fullDiff;
-}
-
-/**
- * @param {vscode.ExtensionContext} context
- */
 export async function activate(context) {
-    console.log('Git Message Gen is now active!');
+    console.log('Git Message Gen: Historian Mode Active');
 
     let disposable = vscode.commands.registerCommand('git-message-gen.generateCommit', async () => {
-        // 1. Grab the Git Extension API
+        // 1. Setup Git API
         const gitExtension = vscode.extensions.getExtension('vscode.git').exports;
         const gitApi = gitExtension.getAPI(1);
-        const repo = gitApi.repositories[0];
+        const repo = getActiveRepo(gitApi);
 
         if (!repo) {
-            vscode.window.showErrorMessage("No Git repository found in the current workspace.");
-            return;
+            return vscode.window.showErrorMessage("No Git repository found.");
         }
 
-        // 2. Get the diff of staged changes
-        const diffText = await getStagedDiff(repo);
+        // 2. Human Intent: The QuickPick
+        // We ask the user for the "Type" first to guide the AI and ensure Journal accuracy
+        const commitTypes = [
+            { label: 'feat', description: 'A new feature' },
+            { label: 'fix', description: 'A bug fix' },
+            { label: 'refactor', description: 'Code change that neither fixes a bug nor adds a feature' },
+            { label: 'docs', description: 'Documentation only changes' },
+            { label: 'chore', description: 'Changes to build process/auxiliary tools' },
+            { label: 'style', description: 'Formatting, missing semi-colons, etc.' },
+            { label: 'test', description: 'Adding or correcting tests' }
+        ];
+
+        const selectedType = await vscode.window.showQuickPick(commitTypes, {
+            placeHolder: 'Select the type of change you are committing',
+            title: 'Git Historian: Step 1'
+        });
+
+        if (!selectedType) return; // User cancelled
+
+        // 3. Data Gathering (The Eyes & Memory)
+        const { diffs, hasDependencyChanges, hasMeaningfulChange } = await getStagedDiffs(repo);
         
-        if (!diffText || diffText.trim() === "") {
-            vscode.window.showWarningMessage("No staged changes found. Please stage your files first!");
-            return;
+        if (!hasMeaningfulChange) {
+            repo.inputBox.value = "style: minor formatting adjustments";
+            // We skip the Journal and the AI call entirely.
+            return vscode.window.showInformationMessage("Detected only whitespace or empty changes. Set to 'style' commit.");
         }
 
-        // 3. Select the AI Model (GPT-4o is standard for Copilot in 2026)
         try {
-            // Try selecting WITHOUT a filter first to see what's available
             let models = await vscode.lm.selectChatModels();
-
-            // If that's empty, try specifically asking for the vendor
             if (models.length === 0) {
                 models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
             }
 
-            const model = models[0]; // Take the first one available
-
+            const model = models[0];
             if (!model) {
-                // This is the error you are hitting
-                vscode.window.showErrorMessage("Still no models found. Check the 'Accounts' icon in the bottom left of VS Code—are you signed into GitHub?");
+                vscode.window.showErrorMessage("No AI models found.");
                 return;
             }
 
-            // 4. Construct the prompt
-            const messages = [
-                vscode.LanguageModelChatMessage.Assistant(COMMIT_SYSTEM_PROMPT),
-                vscode.LanguageModelChatMessage.User(`Analyze this diff and write a commit message:\n\n${diffText}`)
-            ];
+            const branch = await getBranchName(repo);
+            const projectType = await getProjectContext();
+            const history = await getRecentJournalEntries(3);
+            const historyContext = history.map(h => `- ${h.message}`).join('\n');
 
-            // 5. Send request and stream response
-            const response = await model.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
+            // 4. Scaling Logic (The Processor)
+            let aiInput = "";
+            const totalSize = diffs.reduce((acc, f) => acc + f.diff.length, 0);
             
-            let commitMessage = "";
-            for await (const chunk of response.text) {
-                commitMessage += chunk;
+            if (totalSize > 12000) {
+                vscode.window.setStatusBarMessage("$(sync~spin) Summarizing large enterprise diff...", 5000);
+                aiInput = await summarizeLargeDiff(model, diffs);
+            } else {
+                aiInput = diffs.map(f => `File: ${f.path}\n${f.diff}`).join('\n\n');
             }
 
-            // 6. Inject the result into the VS Code Git input box
-            repo.inputBox.value = commitMessage.trim();
-            vscode.window.showInformationMessage("Commit message generated!");
+            // 5. Final Synthesis
+            const messages = [
+                vscode.LanguageModelChatMessage.Assistant(
+                    `${COMMIT_SYSTEM_PROMPT}
+                    ---
+                    USER INTENT: The user has explicitly categorized this as a "${selectedType.label}".
+                    PROJECT: ${projectType}
+                    BRANCH: ${branch}
+                    DEPENDENCIES CHANGED: ${hasDependencyChanges ? 'Yes' : 'No'}
+                    HISTORY:
+                    ${historyContext}`
+                ),
+                vscode.LanguageModelChatMessage.User(
+                    `Generate the description part for a "${selectedType.label}" commit based on these changes:\n\n${scrubSensitiveData(aiInput)}`
+                )
+            ];
+
+            const response = await model.sendRequest(messages, {}, new vscode.CancellationTokenSource().token);
+            
+            let description = "";
+            for await (const chunk of response.text) {
+                description += chunk;
+            }
+
+            // Construct final conventional commit message
+            const finalMessage = `${selectedType.label}: ${description.trim()}`;
+
+            // 6. Injection & Journaling
+            repo.inputBox.value = finalMessage;
+            await addToJournal(finalMessage);
+
+            vscode.window.showInformationMessage("Commit history updated in journal.");
 
         } catch (err) {
-            vscode.window.showErrorMessage(`AI Error: ${err.message}`);
+            vscode.window.showErrorMessage(`Historian Error: ${err.message}`);
             console.error(err);
         }
     });
