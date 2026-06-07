@@ -2,12 +2,13 @@ import * as vscode from 'vscode';
 import { COMMIT_SYSTEM_PROMPT } from './prompts.js';
 import { getStagedDiffs, getProjectContext, getBranchName, getActiveRepo } from './utils/git-bridge.js';
 import { addToJournal, getRecentJournalEntries } from './utils/historian.js';
-import { scrubSensitiveData, summarizeLargeDiff } from './utils/ai-helpers.js';
+import { scrubSensitiveData, summarizeLargeDiff, getAIModel } from './utils/ai-helpers.js';
+import { generateReadmeContent } from './utils/readme-engine.js';
 
 export async function activate(context) {
     console.log('Git Message Gen: Historian Mode Active');
 
-    let disposable = vscode.commands.registerCommand('git-message-gen.generateCommit', async () => {
+    let commitDisposable = vscode.commands.registerCommand('git-message-gen.generateCommit', async () => {
         // 1. Setup Git API
         const gitExtension = vscode.extensions.getExtension('vscode.git').exports;
         const gitApi = gitExtension.getAPI(1);
@@ -46,16 +47,8 @@ export async function activate(context) {
         }
 
         try {
-            let models = await vscode.lm.selectChatModels();
-            if (models.length === 0) {
-                models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
-            }
-
-            const model = models[0];
-            if (!model) {
-                vscode.window.showErrorMessage("No AI models found.");
-                return;
-            }
+            const model = await getAIModel();
+            if (!model) return vscode.window.showErrorMessage("No AI models found.");
 
             const branch = await getBranchName(repo);
             const projectType = await getProjectContext();
@@ -104,6 +97,14 @@ export async function activate(context) {
             repo.inputBox.value = finalMessage;
             await addToJournal(finalMessage);
 
+            // 1. Save to Journal and get current count
+            const commitCount = await addToJournal(finalMessage);
+
+            // 2. Automatic Trigger Check
+            if (commitCount > 0 && commitCount % 10 === 0) {
+                runReadmeArchitect(model);
+            }
+
             vscode.window.showInformationMessage("Commit history updated in journal.");
 
         } catch (err) {
@@ -112,7 +113,68 @@ export async function activate(context) {
         }
     });
 
-    context.subscriptions.push(disposable);
+    // --- COMMAND: Manual README Architect ---
+    let readmeDisposable = vscode.commands.registerCommand('git-message-gen.generateREADME', async () => {
+        const model = await getAIModel();
+        if (model) await runReadmeArchitect(model);
+    });
+
+    context.subscriptions.push(commitDisposable, readmeDisposable);
+}
+
+/**
+ * CORE LOGIC: The README Architect Flow
+ * Handles file checks, user prompts (overwrite vs new), and AI generation
+ */
+async function runReadmeArchitect(model) {
+    const journalEntries = await getRecentJournalEntries(100);
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) return;
+
+    const readmeUri = vscode.Uri.joinPath(workspaceFolder.uri, 'README.md');
+    let existingReadme = false;
+
+    try {
+        await vscode.workspace.fs.stat(readmeUri);
+        existingReadme = true;
+    } catch {
+        existingReadme = false;
+    }
+
+    // 1. Determine User Preference
+    let choice = "Create in New Tab";
+    if (existingReadme) {
+        choice = await vscode.window.showInformationMessage(
+            "The Historian has enough data for a README update. How would you like to proceed?",
+            "Overwrite README.md", 
+            "Create in New Tab"
+        );
+    } else {
+        // If no readme exists, we'll just create it directly or ask
+        choice = await vscode.window.showInformationMessage(
+            "No README found. Should the Architect create one?",
+            "Create README.md",
+            "Preview in New Tab"
+        );
+    }
+
+    if (!choice) return;
+
+    return vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: "Architecting README...",
+    }, async () => {
+        const markdown = await generateReadmeContent(model, journalEntries);
+
+        if (choice === "Overwrite README.md" || choice === "Create README.md") {
+            const encoded = new Uint8Array(Buffer.from(markdown));
+            await vscode.workspace.fs.writeFile(readmeUri, encoded);
+            vscode.window.showInformationMessage("README.md has been architected!");
+        } else {
+            const doc = await vscode.workspace.openTextDocument({ content: markdown, language: 'markdown' });
+            await vscode.window.showTextDocument(doc);
+        }
+    });
 }
 
 export function deactivate() {}

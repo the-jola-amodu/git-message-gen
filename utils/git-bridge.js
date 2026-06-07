@@ -4,6 +4,17 @@ const IGNORED_EXTENSIONS = ['.lock', '.yaml', '.yml', '.log', '.map', '.bin', '.
 const ASSET_EXTENSIONS = ['.svg', '.png', '.jpg', '.jpeg', '.gif', '.mp4', '.mov', '.wav', '.mp3', '.pdf', '.ttf', '.woff', '.woff2'];
 const IGNORED_FOLDERS = ['node_modules', 'dist', 'out', 'build', '.git', '.next', 'target'];
 
+function getStatusLabel(status) {
+    const statusMap = {
+        1: "INDEX_NEW",
+        2: "INDEX_MODIFIED",
+        3: "INDEX_DELETED",
+        4: "INDEX_RENAMED",
+        5: "INDEX_TYPECHANGE"
+    };
+    return statusMap[status] || "MODIFIED";
+}
+
 export function getActiveRepo(gitApi) {
     const activeEditor = vscode.window.activeTextEditor;
     if (!activeEditor) return gitApi.repositories[0];
@@ -16,49 +27,73 @@ export function getActiveRepo(gitApi) {
 }
 
 export async function getStagedDiffs(repo) {
-    const changes = await repo.diffIndexWith('HEAD');
+    let changes;
+    try {
+        changes = await repo.diffIndexWith('HEAD');
+    } catch (err) {
+        // Fallback for initial commit (no HEAD)
+        changes = await repo.diffIndexWith();
+    }
+
     let diffs = [];
     let hasDependencyChanges = false;
     let hasMeaningfulChange = false;
 
     for (const change of changes) {
-        const path = change.uri.fsPath.toLowerCase();
+        const path = change.uri.fsPath;
+        const lowerPath = path.toLowerCase();
+        const statusLabel = getStatusLabel(change.status);
         const isRename = change.status === 3 || change.status === 4;
         
-        // Check for dependency file changes specifically
-        if (path.endsWith('package.json') || path.endsWith('requirements.txt') || path.endsWith('go.mod')) {
+        // 1. Dependency Check
+        if (lowerPath.endsWith('package.json') || lowerPath.endsWith('requirements.txt') || lowerPath.endsWith('go.mod')) {
             hasDependencyChanges = true;
         }
         
-        if (path.includes('/models/') || path.includes('/data/')) {
-            diffs.push({ path: change.uri.fsPath, diff: "[Large Data/Model file changed: Metadata only]" });
+        // 2. Large Data/Folders Filter
+        if (lowerPath.includes('/models/') || lowerPath.includes('/data/')) {
+            diffs.push({ path, diff: "[Large Data/Model file changed: Metadata only]" });
             continue;
         }
 
-        if (IGNORED_EXTENSIONS.some(ext => path.endsWith(ext)) || IGNORED_FOLDERS.some(f => path.includes(f))) continue;
-
-        if (ASSET_EXTENSIONS.some(ext => path.endsWith(ext)) || path.includes('assets/')) {
-            diffs.push({ path: change.uri.fsPath, diff: "[Binary/Asset file skipped]" });
+        // 3. Ignore Rules
+        if (IGNORED_EXTENSIONS.some(ext => lowerPath.endsWith(ext)) || IGNORED_FOLDERS.some(f => lowerPath.includes(f))) continue;
+        
+        // 4. Asset Filter
+        if (ASSET_EXTENSIONS.some(ext => lowerPath.endsWith(ext)) || lowerPath.includes('assets/')) {
+            diffs.push({ path, diff: "[Binary/Asset file skipped]" });
             continue;
         }
         
-        const diff = await repo.diff(change.uri.fsPath);
-        if (isRename) {
-            diff = `[FILE RENAMED/MOVED] Original path might have changed. Diff follows:\n${diff}`;
+        // 5. Deletion Handling
+        if (statusLabel === "INDEX_DELETED") {
+            diffs.push({ path, diff: `[GIT_STATUS: INDEX_DELETED]\n[DELETION EVENT] This file has been removed.` });
             hasMeaningfulChange = true;
+            continue;
         }
+
+        // 6. Diff Acquisition
+        let diff = await repo.diff(path);
+
+        // 7. Meaningful Change Detection (Run before truncation)
         const meaningfulRegex = /^[+-][^+-].*[a-zA-Z0-9]/m;
-        if (meaningfulRegex.test(diff)) {
+        if (meaningfulRegex.test(diff) || isRename) {
             hasMeaningfulChange = true;
         }
 
+        // 8. Rename Labeling
+        if (isRename) {
+            diff = `[FILE RENAMED/MOVED] Original path might have changed.\n${diff}`;
+        }
+
+        // 9. Truncation Logic
         if (diff.length > 20000) {
             const head = diff.substring(0, 5000);
             const tail = diff.substring(diff.length - 5000);
-            diff = `${head}\n\n... [TRUNCATED ${diff.length - 10000} characters for performance] ...\n\n${tail}`;
+            diff = `${head}\n\n... [TRUNCATED ${diff.length - 10000} characters] ...\n\n${tail}`;
         }
 
-        diffs.push({ path: change.uri.fsPath, diff });
+        diffs.push({ path, diff: `[GIT_STATUS: ${statusLabel}]\n${diff}` });
     }
     return { diffs, hasDependencyChanges, hasMeaningfulChange };
 }

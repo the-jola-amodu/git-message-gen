@@ -13,13 +13,33 @@
   "activationEvents": [],
   "main": "./extension.js",
   "contributes": {
-    "commands": [
+  "commands": [
+    {
+      "command": "git-message-gen.generateCommit",
+      "title": "Historian: Generate Message",
+      "icon": "$(magic)"
+    },
+    {
+      "command": "git-message-gen.generateREADME",
+      "title": "Historian: Architect README",
+      "icon": "$(book)"
+    }
+  ],
+  "menus": {
+    "scm/title": [
       {
         "command": "git-message-gen.generateCommit",
-        "title": "Git Gen: Generate Commit Message"
+        "group": "navigation",
+        "when": "scmProvider == git"
+      },
+      {
+        "command": "git-message-gen.generateREADME",
+        "group": "navigation",
+        "when": "scmProvider == git"
       }
     ]
-  },
+  }
+},
   "scripts": {
     "lint": "eslint .",
     "pretest": "npm run lint",

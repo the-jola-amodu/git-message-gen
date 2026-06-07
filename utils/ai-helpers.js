@@ -38,3 +38,11 @@ export async function summarizeLargeDiff(model, fileDiffs) {
     }
     return summaries.join('\n');
 }
+
+export async function getAIModel() {
+    let models = await vscode.lm.selectChatModels();
+    if (models.length === 0) {
+        models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+    }
+    return models[0];
+}
